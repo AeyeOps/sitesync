@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., 0.6.0)"
+        required: true
+        type: string
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+
+  build-binary-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra bundle
+      - run: make bundle
+      - name: Rename binary with version
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          mv build/pyinstaller/dist/sitesync build/pyinstaller/dist/sitesync-${VERSION}-linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-x64
+          path: build/pyinstaller/dist/sitesync-*-linux-x64
+
+  build-binary-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra bundle
+      - run: make bundle
+      - name: Rename binary with version
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          mv build/pyinstaller/dist/sitesync build/pyinstaller/dist/sitesync-${VERSION}-linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-arm64
+          path: build/pyinstaller/dist/sitesync-*-linux-arm64
+
+  release:
+    needs: [build-wheel, build-binary-x64, build-binary-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version && format('v{0}', github.event.inputs.version) || github.ref_name }}
+          name: ${{ github.event.inputs.version && format('v{0}', github.event.inputs.version) || github.ref_name }}
+          files: artifacts/*
+          generate_release_notes: true

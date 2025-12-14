@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sitesync"
+version = "0.6.0"
+description = "Synchronize website assets into a structured ontology."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "Aeye Ops" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "typer>=0.21,<0.22",
+    "click>=8.3,<9",
+    "rich>=14.2,<15",
+    "pydantic>=2.12,<3",
+    "pyyaml>=6.0.3,<7",
+    "python-dotenv>=1.2.1,<2",
+    "playwright>=1.57,<2",
+    "beautifulsoup4>=4.14,<5",
+    "tenacity>=9.1,<10",
+    "importlib-metadata>=8.7,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.14,<0.15",
+    "pytest>=9.0,<10",
+    "pytest-asyncio>=1.3,<2",
+    "pre-commit>=4.2,<5",
+]
+
+bundle = [
+    "pyinstaller>=6.17,<7",
+]
+
+[project.scripts]
+sitesync = "sitesync.__main__:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "PL"]
+ignore = [
+    "E203",    # whitespace before ':'
+    "B008",    # function call in default argument (typer.Option is idiomatic)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# CLI commands naturally have many options, complex branching, and conditional imports
+"src/sitesync/cli/*.py" = ["PLC0415", "PLR0912", "PLR0913", "PLR0915"]
+# Conditional imports for cross-platform/optional dependencies
+"src/sitesync/ui/hotkeys.py" = ["PLC0415", "PLR0912", "PLR0913", "PLR0915"]
+"src/sitesync/fetchers/playwright.py" = ["PLC0415", "PLR0912", "PLR0915"]
+"src/sitesync/plugins/registry.py" = ["PLC0415"]
+# Executor has complex async logic and domain matching
+"src/sitesync/core/executor.py" = ["PLR0912", "PLR0913", "PLR0915"]
+# Storage has functions with many columns
+"src/sitesync/storage/db.py" = ["PLR0913"]
+# Tests may have conditional imports and complex setup
+"tests/**" = ["PLR2004", "PLC0415", "PLR0913"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end smoke tests (run via `make e2e`)",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "sitesync/THIRD_PARTY_NOTICES.md"

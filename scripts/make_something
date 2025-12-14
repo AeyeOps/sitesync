@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Convenience wrapper for running the pytest e2e suite.
+
+The canonical e2e coverage lives in pytest (see `tests/test_e2e_cli_smoke.py`).
+This script exists as a lightweight entry point for manual, verbose runs.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+
+def main() -> int:
+    args = [sys.executable, "-m", "pytest", "tests/e2e", "-s", "-vv", *sys.argv[1:]]
+    completed = subprocess.run(args, check=False)
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

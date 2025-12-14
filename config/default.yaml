@@ -1,0 +1,41 @@
+# Global configuration defaults for Sitesync.
+
+version: 1
+default_source: default
+
+logging:
+  path: null
+  level: info
+
+crawler:
+  parallel_agents: 2
+  pages_per_agent: 2
+  jitter_seconds: 1.0
+  heartbeat_seconds: 30.0
+  max_retries: 3
+  backoff_min_seconds: 1.0
+  backoff_max_seconds: 60.0
+  backoff_multiplier: 2.0
+  fetch_timeout_seconds: null
+
+storage:
+  path: null
+
+outputs:
+  base_path: data
+  raw_subdir: raw
+  normalized_subdir: normalized
+  metadata_subdir: runs
+
+sources:
+  - name: default
+    start_urls: []
+    allowed_domains: {}
+    depth: 1
+    plugins: []
+    parallel_agents: null
+    pages_per_agent: null
+    jitter_seconds: null
+    max_pages: null
+    fetcher: playwright
+    fetcher_options: {}
