@@ -1,16 +1,17 @@
 UV ?= uv
-PREFIX ?= /usr/local
+PREFIX ?= /opt
 BINDIR ?= $(PREFIX)/bin
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install install-dev validate test e2e build release-build bundle install-bundle standalone clean
+.PHONY: help install install-dev lint test build bundle install-bundle standalone clean
+.PHONY: e2e
 
 help:
 	@echo "Sitesync Make targets:"
 	@echo "  install       Build a wheel and install sitesync into $(BINDIR)"
 	@echo "  install-dev   Install dev dependencies into the uv environment"
-	@echo "  validate      Run all quality checks (ruff, uv ty, pytest)"
+	@echo "  lint          Run lint + typecheck via scripts/make_quality.sh"
 	@echo "  test          Run unit tests"
 	@echo "  e2e           Run end-to-end tests"
 	@echo "  build         Build a wheel"
@@ -20,6 +21,9 @@ help:
 	@echo "Overrides:"
 	@echo "  PREFIX=/opt   Install prefix used by make install (bin lives in PREFIX/bin)"
 	@echo "  BINDIR=/opt/bin   Install directory for standalone binary"
+	@echo ""
+	@echo "Other:"
+	@echo "  scripts/make_quality.sh format   Format code via the shared script"
 
 install: build
 	install -d $(BINDIR)
@@ -28,11 +32,8 @@ install: build
 install-dev:
 	$(UV) sync --extra dev
 
-validate:
-	$(UV) run ruff check --fix src tests
-	$(UV) run ruff format src tests
-	uvx ty check src
-	$(UV) run pytest tests --ignore=tests/e2e
+lint:
+	scripts/make_quality.sh all
 
 test:
 	$(UV) run pytest tests --ignore=tests/e2e
@@ -43,10 +44,6 @@ e2e:
 build:
 	rm -f dist/sitesync-*.whl
 	$(UV) build --wheel
-
-release-build:
-	$(UV) build
-	@echo "Wheel built in dist/"
 
 bundle:
 	$(UV) run --extra bundle pyinstaller --clean --noconfirm \

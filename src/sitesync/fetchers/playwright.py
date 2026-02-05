@@ -6,14 +6,14 @@ import asyncio
 import json
 import logging
 import os
-import sys
-import time
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, ClassVar
+import sys
+import time
+from typing import Any, ClassVar, Optional
 
-from sitesync.core.executor import Fetcher, FetchError, FetchResult, TransientFetchError
+from sitesync.core.executor import FetchError, FetchResult, Fetcher, TransientFetchError
 from sitesync.storage import TaskRecord
 
 
@@ -27,23 +27,23 @@ class PlaywrightFetcher(Fetcher):
     navigation_timeout: float = 30.0
     wait_after_load: float = 1.5
     wait_until: str = "networkidle"
-    wait_for_selector: str | None = None
+    wait_for_selector: Optional[str] = None
     wait_for_selector_timeout: float = 5.0
     raw_dir: Path = field(default_factory=lambda: Path.cwd() / "data" / "raw")
-    normalized_dir: Path | None = None
+    normalized_dir: Optional[Path] = None
     capture_screenshot: bool = False
     screenshot_format: str = "png"
     _install_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _installed_browsers: ClassVar[set[str]] = set()
 
     async def fetch(self, task: TaskRecord) -> FetchResult:
-        raw_path: Path | None = None
-        checksum: str | None = None
-        metadata_json: str | None = None
-        screenshot_path: Path | None = None
-        html: str | None = None
-        browser_handle: Any | None = None
-        context_handle: Any | None = None
+        raw_path: Optional[Path] = None
+        checksum: Optional[str] = None
+        metadata_json: Optional[str] = None
+        screenshot_path: Optional[Path] = None
+        html: Optional[str] = None
+        browser_handle: Optional[Any] = None
+        context_handle: Optional[Any] = None
         started_at = time.monotonic()
         self.logger.debug(
             "Fetch start url=%s wait_until=%s timeout=%ss",
@@ -52,8 +52,8 @@ class PlaywrightFetcher(Fetcher):
             self.navigation_timeout,
         )
         try:
-            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             from playwright.async_api import async_playwright
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         except ImportError as exc:  # pragma: no cover - runtime dependency
             raise FetchError(
                 "Playwright is not installed. Run `uv sync` with dependencies."
@@ -136,7 +136,6 @@ class PlaywrightFetcher(Fetcher):
                             html is not None
                             and self.capture_screenshot
                             and self.normalized_dir is not None
-                            and raw_path is not None
                         ):
                             screenshot_name = f"{raw_path.stem}.{self.screenshot_format}"
                             screenshot_path = self.normalized_dir / screenshot_name
@@ -149,7 +148,18 @@ class PlaywrightFetcher(Fetcher):
 
         except TransientFetchError:
             raise
+        except FetchError:
+            raise
         except Exception as exc:  # pylint: disable=broad-except
+            msg = str(exc)
+            permanent_patterns = ("Download is starting",)
+            if any(pattern in msg for pattern in permanent_patterns):
+                self.logger.warning(
+                    "Fetch permanent failure url=%s error=%s", task.url, exc
+                )
+                raise FetchError(
+                    f"Non-fetchable URL {task.url}: {exc}"
+                ) from exc
             self.logger.warning("Fetch failed url=%s error=%s", task.url, exc)
             raise TransientFetchError(f"Playwright error for {task.url}: {exc}") from exc
 
@@ -167,8 +177,8 @@ class PlaywrightFetcher(Fetcher):
 
     @classmethod
     def from_options(
-        cls, logger: logging.Logger, *, options: dict[str, Any] | None = None
-    ) -> PlaywrightFetcher:
+        cls, logger: logging.Logger, *, options: Optional[dict[str, Any]] = None
+    ) -> "PlaywrightFetcher":
         options = options or {}
 
         if getattr(sys, "frozen", False):
@@ -237,8 +247,7 @@ class PlaywrightFetcher(Fetcher):
                     "Playwright install failed (%s): %s", browser_name, stderr or stdout
                 )
                 raise TransientFetchError(
-                    "Unable to install Playwright browsers automatically; "
-                    "run `playwright install` manually."
+                    "Unable to install Playwright browsers automatically; run `playwright install` manually."
                 )
 
             if stdout:

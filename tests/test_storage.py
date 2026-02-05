@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 from sitesync.storage import Database
 from sitesync.storage.db import ISO_FORMAT
@@ -129,7 +130,7 @@ def test_acquire_tasks_reclaims_expired_leases(tmp_path):
     assert len(leased) == 1
     task_id = leased[0].id
 
-    expired = (datetime.now(UTC) - timedelta(seconds=60)).strftime(ISO_FORMAT)
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime(ISO_FORMAT)
     with database.connect() as connection:
         connection.execute(
             "UPDATE crawl_tasks SET lease_expires_at = ? WHERE id = ?",
@@ -143,11 +144,140 @@ def test_acquire_tasks_reclaims_expired_leases(tmp_path):
         lease_owner="worker-2",
         lease_seconds=10,
         max_retries=3,
-        backoff_seconds=0,  # Zero backoff to reclaim immediately
+        backoff_seconds=0,
     )
     assert len(reclaimed) == 1
     assert reclaimed[0].id == task_id
     assert reclaimed[0].lease_owner == "worker-2"
+
+
+def test_enqueue_seed_tasks_with_task_type(tmp_path):
+    database = Database(tmp_path / "sitesync.sqlite")
+    database.initialize()
+
+    run = database.start_run("example")
+    queued = database.enqueue_seed_tasks(
+        run.id, [("https://cdn.example.com/image.png", 0)], task_type="media"
+    )
+    assert queued == 1
+
+    tasks = database.list_tasks_for_run(run.id)
+    assert len(tasks) == 1
+    assert tasks[0].task_type == "media"
+    assert tasks[0].depth == 0
+
+    # Page tasks use default
+    queued2 = database.enqueue_seed_tasks(run.id, [("https://example.com/page", 2)])
+    assert queued2 == 1
+    tasks = database.list_tasks_for_run(run.id)
+    page_tasks = [t for t in tasks if t.task_type == "page"]
+    assert len(page_tasks) == 1
+
+
+def test_acquire_tasks_returns_task_type(tmp_path):
+    database = Database(tmp_path / "sitesync.sqlite")
+    database.initialize()
+
+    run = database.start_run("example")
+    database.enqueue_seed_tasks(
+        run.id, [("https://example.com/image.png", 0)], task_type="media"
+    )
+    database.enqueue_seed_tasks(
+        run.id, [("https://example.com/page", 1)], task_type="page"
+    )
+
+    tasks = database.acquire_tasks(
+        run.id, limit=10, lease_owner="worker", lease_seconds=10,
+        max_retries=3, backoff_seconds=1,
+    )
+    assert len(tasks) == 2
+    types = {t.task_type for t in tasks}
+    assert types == {"media", "page"}
+
+
+def test_task_type_migration(tmp_path):
+    """Verify migration adds task_type to pre-existing databases."""
+    db_path = tmp_path / "sitesync.sqlite"
+    database = Database(db_path)
+
+    # Create the old schema without task_type
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            label TEXT
+        );
+        CREATE TABLE IF NOT EXISTS crawl_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            depth INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            priority INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            next_run_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+            created_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+            updated_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+            UNIQUE(run_id, url),
+            FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            source_url TEXT NOT NULL,
+            asset_key TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            checksum TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(run_id, asset_key),
+            FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS asset_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            checksum TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            raw_path TEXT,
+            normalized_path TEXT,
+            metadata_json TEXT,
+            UNIQUE(asset_id, version),
+            FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS exceptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            stage TEXT NOT NULL,
+            url TEXT,
+            asset_key TEXT,
+            message TEXT NOT NULL,
+            context_json TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+        );
+    """)
+    conn.close()
+
+    # Now initialize should add the migration
+    database.initialize()
+
+    # Verify column exists
+    with database.connect() as connection:
+        cursor = connection.execute("PRAGMA table_info(crawl_tasks)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert "task_type" in columns
 
 
 def test_expired_leases_hit_retry_limit(tmp_path):
@@ -168,7 +298,7 @@ def test_expired_leases_hit_retry_limit(tmp_path):
     assert len(leased) == 1
     task_id = leased[0].id
 
-    expired = (datetime.now(UTC) - timedelta(seconds=60)).strftime(ISO_FORMAT)
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime(ISO_FORMAT)
     with database.connect() as connection:
         connection.execute(
             "UPDATE crawl_tasks SET lease_expires_at = ? WHERE id = ?",

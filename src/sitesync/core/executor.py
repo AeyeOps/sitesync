@@ -8,15 +8,15 @@ import json
 import logging
 import time
 from asyncio import QueueEmpty, QueueFull
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol
-from urllib.parse import parse_qs, urldefrag, urljoin, urlparse
+from typing import Awaitable, Callable, Dict, Optional, Protocol, Set
+import re
+from urllib.parse import urljoin, urlparse, urldefrag, parse_qs, urlencode, parse_qsl
 
 from bs4 import BeautifulSoup
-from tenacity import (
+from tenacity import (  # type: ignore[import-not-found]
     AsyncRetrying,
     RetryError,
     retry_if_exception_type,
@@ -42,11 +42,11 @@ class FetchResult:
     """Result returned by a fetcher implementation."""
 
     assets_created: int
-    raw_payload_path: str | None = None
-    normalized_payload_path: str | None = None
-    checksum: str | None = None
+    raw_payload_path: Optional[str] = None
+    normalized_payload_path: Optional[str] = None
+    checksum: Optional[str] = None
     asset_type: str = "page"
-    metadata_json: str | None = None
+    metadata_json: Optional[str] = None
 
 
 class Fetcher(Protocol):
@@ -58,6 +58,19 @@ class Fetcher(Protocol):
 
 FetchHook = Callable[[TaskRecord, FetchResult], Awaitable[None]]
 
+_BINARY_EXTENSIONS: Set[str] = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico", ".webp", ".avif", ".tiff",
+    ".mp4", ".mp3", ".wav", ".avi", ".mov", ".wmv", ".mkv", ".webm", ".ogg", ".ogv",
+    ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z", ".dmg", ".exe", ".iso",
+    ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx",
+    ".css", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+}
+
+_TRACKING_PARAMS: Set[str] = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+    "hsutk", "__hstc", "__hssc", "__hsfp", "hsCtaTracking",
+}
+
 
 @dataclass(slots=True)
 class CrawlExecutor:
@@ -68,15 +81,16 @@ class CrawlExecutor:
     database: Database
     fetcher: Fetcher
     logger: logging.Logger
-    on_success: FetchHook | None = None
-    on_failure: Callable[[TaskRecord, Exception], Awaitable[None]] | None = None
-    dashboard: Dashboard | None = None
-    _agent_metrics: dict[str, AgentMetrics] = field(default_factory=dict, init=False)
+    on_success: Optional[FetchHook] = None
+    on_failure: Optional[Callable[[TaskRecord, Exception], Awaitable[None]]] = None
+    dashboard: Optional[Dashboard] = None
+    media_fetcher: Optional[Fetcher] = None
+    _agent_metrics: Dict[str, "AgentMetrics"] = field(default_factory=dict, init=False)
     _start_time: float = field(default=0.0, init=False)
     _run_id: int = field(default=-1, init=False)
     _parallel_agents: int = field(default=0, init=False)
     _log_path: str = field(default="sitesync.log", init=False)
-    _runtime_denies: dict[str, set[str]] = field(default_factory=dict, init=False)
+    _runtime_denies: Dict[str, Set[str]] = field(default_factory=dict, init=False)
 
     async def run(
         self,
@@ -84,11 +98,11 @@ class CrawlExecutor:
         *,
         parallel_agents: int,
         log_path: str,
-        stop_signal: asyncio.Event | None = None,
+        stop_signal: Optional[asyncio.Event] = None,
     ) -> None:
         """Run crawl workers until queue is drained."""
 
-        queue: asyncio.Queue[TaskRecord | None] = asyncio.Queue()
+        queue: asyncio.Queue[Optional[TaskRecord]] = asyncio.Queue()
         stop_event = stop_signal or asyncio.Event()
 
         self._start_time = time.monotonic()
@@ -108,7 +122,9 @@ class CrawlExecutor:
             for domain, rules in self.source.allowed_domains.items():
                 allow = rules.allow_paths or []
                 deny = rules.deny_paths or []
-                self.logger.debug("Domain filter %s allow=%s deny=%s", domain, allow, deny)
+                self.logger.debug(
+                    "Domain filter %s allow=%s deny=%s", domain, allow, deny
+                )
         else:
             self.logger.debug("No domain filters configured.")
         if self.dashboard:
@@ -125,7 +141,7 @@ class CrawlExecutor:
         workers = [
             asyncio.create_task(
                 self._worker_loop(
-                    name=f"agent-{index + 1:02d}",
+                    name=f"agent-{index+1:02d}",
                     run_id=run_id,
                     queue=queue,
                     stop_event=stop_event,
@@ -152,7 +168,7 @@ class CrawlExecutor:
             stop_waiter.cancel()
             await asyncio.gather(stop_waiter, return_exceptions=True)
 
-    def get_runtime_denies(self) -> dict[str, list[str]]:
+    def get_runtime_denies(self) -> Dict[str, list[str]]:
         """Return runtime deny rules accumulated during the run."""
         return {domain: sorted(patterns) for domain, patterns in self._runtime_denies.items()}
 
@@ -160,7 +176,7 @@ class CrawlExecutor:
         self,
         *,
         run_id: int,
-        queue: asyncio.Queue[TaskRecord | None],
+        queue: asyncio.Queue[Optional[TaskRecord]],
         stop_event: asyncio.Event,
         worker_count: int,
     ) -> None:
@@ -187,7 +203,9 @@ class CrawlExecutor:
             if not tasks:
                 active = self.database.count_active_tasks(run_id)
                 if active == 0:
-                    self.logger.info("No pending tasks and no active leases; stopping producer.")
+                    self.logger.info(
+                        "No pending tasks and no active leases; stopping producer."
+                    )
                     for _ in range(worker_count):
                         await queue.put(None)
                     sentinels_emitted = True
@@ -211,6 +229,12 @@ class CrawlExecutor:
                 if parsed.scheme not in ("http", "https") or not parsed.netloc:
                     self.database.mark_task_error(task.id, error="filtered invalid url")
                     filtered_invalid += 1
+                    continue
+                # Media tasks skip domain/path filtering -- they were validated
+                # at discovery time from an allowed page
+                if task.task_type == "media":
+                    await queue.put(task)
+                    queued_count += 1
                     continue
                 host = parsed.netloc.lower()
                 if not self._host_allowed(host, allowed_suffixes):
@@ -244,7 +268,7 @@ class CrawlExecutor:
         self,
         *,
         run_id: int,
-        queue: asyncio.Queue[TaskRecord | None],
+        queue: asyncio.Queue[Optional[TaskRecord]],
         workers: list[asyncio.Task],
         producer: asyncio.Task,
         worker_count: int,
@@ -278,8 +302,7 @@ class CrawlExecutor:
                 break
 
         self.logger.info(
-            "Stop signal handled; returned %s queued task(s) and %s in-progress task(s) "
-            "to pending.",
+            "Stop signal handled; returned %s queued task(s) and %s in-progress task(s) to pending.",
             drained,
             released,
         )
@@ -291,7 +314,7 @@ class CrawlExecutor:
         *,
         name: str,
         run_id: int,
-        queue: asyncio.Queue[TaskRecord | None],
+        queue: asyncio.Queue[Optional[TaskRecord]],
         stop_event: asyncio.Event,
     ) -> None:
         retry_policy = AsyncRetrying(
@@ -305,7 +328,7 @@ class CrawlExecutor:
             reraise=False,
         )
 
-        task: TaskRecord | None = None
+        task: Optional[TaskRecord] = None
         try:
             while True:
                 task = await queue.get()
@@ -327,7 +350,7 @@ class CrawlExecutor:
                     self.logger.debug("%s picked task %s", name, task.id)
 
                     try:
-                        result: FetchResult | None = None
+                        result: Optional[FetchResult] = None
                         success_attempt = 1
                         async for attempt in retry_policy:
                             attempt_number = attempt.retry_state.attempt_number
@@ -339,14 +362,17 @@ class CrawlExecutor:
                             )
                             with attempt:
                                 try:
+                                    active_fetcher = self.fetcher
+                                    if task.task_type == "media" and self.media_fetcher is not None:
+                                        active_fetcher = self.media_fetcher
                                     if self.config.crawler.fetch_timeout_seconds:
                                         result = await asyncio.wait_for(
-                                            self.fetcher.fetch(task),
+                                            active_fetcher.fetch(task),
                                             timeout=self.config.crawler.fetch_timeout_seconds,
                                         )
                                     else:
-                                        result = await self.fetcher.fetch(task)
-                                except TimeoutError as exc:
+                                        result = await active_fetcher.fetch(task)
+                                except asyncio.TimeoutError as exc:
                                     raise TransientFetchError(
                                         f"Timeout while fetching {task.url}"
                                     ) from exc
@@ -368,15 +394,15 @@ class CrawlExecutor:
                         )
                         if self.on_success is not None:
                             await self.on_success(task, result)
-                        auth_redirected = self._handle_auth_redirect(task.url, result)
-                        if not auth_redirected:
-                            await self._discover_links(run_id, task, result)
+                        if task.task_type != "media":
+                            auth_redirected = self._handle_auth_redirect(task.url, result)
+                            if not auth_redirected:
+                                await self._discover_links(run_id, task, result)
                         self.logger.debug("%s completed task %s", name, task.id)
                         self._update_queue_snapshot(run_id)
                     except RetryError as exc:
                         last = exc.last_attempt
-                        raw_error = last.exception() if last else exc
-                        error = raw_error if isinstance(raw_error, Exception) else exc
+                        error = last.exception() if last else exc
                         attempts = last.attempt_number if last else 0
                         self.logger.warning(
                             "%s exhausted retries for task %s: %s",
@@ -395,6 +421,20 @@ class CrawlExecutor:
                         if self.on_failure is not None:
                             await self.on_failure(task, error)
                         self._update_queue_snapshot(run_id)
+                    except FetchError as exc:
+                        self.logger.warning(
+                            "%s permanent fetch error on task %s: %s", name, task.id, exc
+                        )
+                        self.database.mark_task_error(task.id, error=str(exc))
+                        self._update_agent_snapshot(
+                            name,
+                            state="error",
+                            current_url=task.url,
+                            last_status="permanent error",
+                        )
+                        if self.on_failure is not None:
+                            await self.on_failure(task, exc)
+                        self._update_queue_snapshot(run_id)
                     except Exception as exc:  # pylint: disable=broad-except
                         self.logger.error(
                             "%s encountered fatal error on task %s: %s", name, task.id, exc
@@ -403,6 +443,7 @@ class CrawlExecutor:
                             task.id,
                             error=str(exc),
                             backoff_seconds=self.config.crawler.backoff_min_seconds,
+                            max_retries=self.config.crawler.max_retries,
                         )
                         self._update_agent_snapshot(
                             name,
@@ -442,9 +483,9 @@ class CrawlExecutor:
         self,
         name: str,
         *,
-        state: str | None = None,
-        current_url: str | None = None,
-        last_status: str | None = None,
+        state: Optional[str] = None,
+        current_url: Optional[str] = None,
+        last_status: Optional[str] = None,
         fetch_increment: int = 0,
         retry_increment: int = 0,
         asset_increment: int = 0,
@@ -514,9 +555,6 @@ class CrawlExecutor:
         self.dashboard.set_run_snapshot(snapshot)
 
     async def _discover_links(self, run_id: int, task: TaskRecord, result: FetchResult) -> None:
-        if task.depth <= 1:
-            return
-
         raw_path = result.raw_payload_path
         if not raw_path:
             return
@@ -544,50 +582,116 @@ class CrawlExecutor:
             base_url = metadata.get("url", base_url)
 
         allowed_suffixes = self._build_allowed_suffixes(base_url)
-        next_depth = task.depth - 1
 
-        discovered: set[str] = set()
-        for anchor in soup.find_all("a", href=True):
-            href = anchor.get("href")
-            if not href or not isinstance(href, str):
-                continue
+        discovered_pages: Set[str] = set()
+        discovered_media: Set[str] = set()
+
+        def _resolve_and_classify(href: str, force_type: str | None = None) -> None:
+            """Resolve a URL and add it to the appropriate set."""
             href = href.strip()
-            if not href:
-                continue
-
+            if not href or href.startswith(("data:", "javascript:", "#")):
+                return
             absolute = urljoin(base_url, href)
             absolute = urldefrag(absolute)[0]
+            absolute = self._strip_tracking_params(absolute)
             parsed = urlparse(absolute)
             if parsed.scheme not in ("http", "https") or not parsed.netloc:
-                continue
-
-            host = parsed.netloc.lower()
-            if not self._host_allowed(host, allowed_suffixes):
-                continue
-            if not self._path_allowed(host, parsed.path):
-                continue
-
+                return
             if absolute == task.url:
-                continue
+                return
 
-            if self._is_binary_path(parsed.path):
-                continue
+            url_type = force_type or self._classify_url_type(parsed.path)
 
-            discovered.add(absolute)
+            if url_type == "media":
+                discovered_media.add(absolute)
+            else:
+                host = parsed.netloc.lower()
+                if not self._host_allowed(host, allowed_suffixes):
+                    return
+                if not self._path_allowed(host, parsed.path):
+                    return
+                discovered_pages.add(absolute)
 
-        if not discovered:
-            return
+        # Anchor links -> pages or media based on URL extension
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href")
+            if href:
+                _resolve_and_classify(href)
 
-        seeds = [(url, next_depth) for url in discovered]
-        queued = self.database.enqueue_seed_tasks(run_id, seeds)
-        if queued:
-            self.logger.debug("Queued %s new URL(s) from %s", queued, task.url)
+        # Images
+        for tag in soup.find_all("img", src=True):
+            src = tag.get("src")
+            if src:
+                _resolve_and_classify(src, force_type="media")
+        for tag in soup.find_all("img", {"srcset": True}):
+            srcset = tag.get("srcset", "")
+            for entry in srcset.split(","):
+                parts = entry.strip().split()
+                if parts:
+                    _resolve_and_classify(parts[0], force_type="media")
 
-    def _build_allowed_suffixes(self, base_url: str) -> set[str]:
-        suffixes: set[str] = set()
+        # Video/Audio
+        for tag in soup.find_all(["video", "audio"], src=True):
+            src = tag.get("src")
+            if src:
+                _resolve_and_classify(src, force_type="media")
+        for tag in soup.find_all("video", poster=True):
+            poster = tag.get("poster")
+            if poster:
+                _resolve_and_classify(poster, force_type="media")
+        for tag in soup.find_all("source", src=True):
+            src = tag.get("src")
+            if src:
+                _resolve_and_classify(src, force_type="media")
 
-        for raw_domain in self.source.allowed_domains:
-            domain = raw_domain.lower().lstrip(".")
+        # Stylesheets and icons
+        for tag in soup.find_all("link", href=True):
+            rel = tag.get("rel", [])
+            if any(r in rel for r in ("stylesheet", "icon", "apple-touch-icon", "shortcut")):
+                href = tag.get("href")
+                if href:
+                    _resolve_and_classify(href, force_type="media")
+
+        # OG/Twitter meta images
+        for tag in soup.find_all("meta", {"property": re.compile(r"og:image")}):
+            content = tag.get("content")
+            if content:
+                _resolve_and_classify(content, force_type="media")
+        for tag in soup.find_all("meta", {"name": "twitter:image"}):
+            content = tag.get("content")
+            if content:
+                _resolve_and_classify(content, force_type="media")
+
+        # Embedded objects
+        for tag in soup.find_all("object", data=True):
+            data = tag.get("data")
+            if data:
+                _resolve_and_classify(data, force_type="media")
+        for tag in soup.find_all("embed", src=True):
+            src = tag.get("src")
+            if src:
+                _resolve_and_classify(src, force_type="media")
+
+        # Queue discovered pages (only if depth allows further crawling)
+        if task.depth > 1 and discovered_pages:
+            next_depth = task.depth - 1
+            page_seeds = [(url, next_depth) for url in discovered_pages]
+            queued = self.database.enqueue_seed_tasks(run_id, page_seeds, task_type="page")
+            if queued:
+                self.logger.debug("Queued %s page URL(s) from %s", queued, task.url)
+
+        # Queue discovered media (always depth=0, terminal)
+        if discovered_media:
+            media_seeds = [(url, 0) for url in discovered_media]
+            queued = self.database.enqueue_seed_tasks(run_id, media_seeds, task_type="media")
+            if queued:
+                self.logger.debug("Queued %s media URL(s) from %s", queued, task.url)
+
+    def _build_allowed_suffixes(self, base_url: str) -> Set[str]:
+        suffixes: Set[str] = set()
+
+        for domain in self.source.allowed_domains:
+            domain = domain.lower().lstrip(".")
             if not domain:
                 continue
             suffixes.add(domain)
@@ -642,28 +746,28 @@ class CrawlExecutor:
         host = host.lower()
         best_domain = ""
         best_rules = None
-        for raw_domain, rules in self.source.allowed_domains.items():
-            domain = raw_domain.lower().lstrip(".")
+        for domain, rules in self.source.allowed_domains.items():
+            domain = domain.lower().lstrip(".")
             if not domain:
                 continue
-            is_match = host == domain or host.endswith(f".{domain}")
-            if is_match and len(domain) > len(best_domain):
-                best_domain = domain
-                best_rules = rules
+            if host == domain or host.endswith(f".{domain}"):
+                if len(domain) > len(best_domain):
+                    best_domain = domain
+                    best_rules = rules
         return best_rules
 
-    def _match_runtime_denies(self, host: str) -> set[str]:
+    def _match_runtime_denies(self, host: str) -> Set[str]:
         host = host.lower()
         best_domain = ""
-        best_rules: set[str] = set()
-        for raw_domain, rules in self._runtime_denies.items():
-            domain = raw_domain.lower().lstrip(".")
+        best_rules: Set[str] = set()
+        for domain, rules in self._runtime_denies.items():
+            domain = domain.lower().lstrip(".")
             if not domain:
                 continue
-            is_match = host == domain or host.endswith(f".{domain}")
-            if is_match and len(domain) > len(best_domain):
-                best_domain = domain
-                best_rules = rules
+            if host == domain or host.endswith(f".{domain}"):
+                if len(domain) > len(best_domain):
+                    best_domain = domain
+                    best_rules = rules
         return best_rules
 
     def _handle_auth_redirect(self, task_url: str, result: FetchResult) -> bool:
@@ -711,7 +815,7 @@ class CrawlExecutor:
                 )
         return True
 
-    def _add_runtime_deny(self, host: str, pattern: str, added: list[str] | None = None) -> None:
+    def _add_runtime_deny(self, host: str, pattern: str, added: Optional[list[str]] = None) -> None:
         if not pattern:
             return
         host = host.lower()
@@ -722,7 +826,7 @@ class CrawlExecutor:
                 added.append(pattern)
 
     @staticmethod
-    def _host_allowed(host: str, suffixes: set[str]) -> bool:
+    def _host_allowed(host: str, suffixes: Set[str]) -> bool:
         if not suffixes:
             return True
         host = host.lower()
@@ -734,40 +838,26 @@ class CrawlExecutor:
         return False
 
     @staticmethod
-    def _is_binary_path(path: str) -> bool:
-        path = path.lower()
-        binary_exts = {
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".bmp",
-            ".svg",
-            ".ico",
-            ".mp4",
-            ".mp3",
-            ".wav",
-            ".avi",
-            ".mov",
-            ".wmv",
-            ".mkv",
-            ".pdf",
-            ".zip",
-            ".tar",
-            ".gz",
-            ".rar",
-            ".7z",
-            ".dmg",
-            ".exe",
-            ".iso",
-            ".ppt",
-            ".pptx",
-            ".doc",
-            ".docx",
-            ".xls",
-            ".xlsx",
-        }
-        return any(path.endswith(ext) for ext in binary_exts)
+    def _classify_url_type(path: str) -> str:
+        """Return 'media' if the URL path looks like a binary/media asset, else 'page'."""
+        path_lower = path.lower()
+        for ext in _BINARY_EXTENSIONS:
+            if path_lower.endswith(ext):
+                return "media"
+        return "page"
+
+    @staticmethod
+    def _strip_tracking_params(url: str) -> str:
+        """Remove common tracking query parameters from a URL."""
+        parsed = urlparse(url)
+        if not parsed.query:
+            return url
+        params = parse_qsl(parsed.query)
+        filtered = [(k, v) for k, v in params if k not in _TRACKING_PARAMS]
+        if len(filtered) == len(params):
+            return url
+        new_query = urlencode(filtered)
+        return parsed._replace(query=new_query).geturl()
 
 
 @dataclass(slots=True)

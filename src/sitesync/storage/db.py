@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Iterable, Iterator, Optional
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -16,7 +15,7 @@ ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 def _utcnow() -> str:
     """Return the current UTC timestamp in ISO format."""
 
-    return datetime.now(UTC).strftime(ISO_FORMAT)
+    return datetime.now(timezone.utc).strftime(ISO_FORMAT)
 
 
 @dataclass(slots=True)
@@ -27,14 +26,14 @@ class RunRecord:
     source: str
     status: str
     started_at: str
-    completed_at: str | None
-    label: str | None
+    completed_at: Optional[str]
+    label: Optional[str]
 
 
 class Database:
     """SQLite-backed storage for Sitesync state."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Optional[Path] = None) -> None:
         self.path = (path or Path.cwd() / "sitesync.sqlite").resolve()
 
     @contextmanager
@@ -80,6 +79,7 @@ class Database:
                     next_run_at TEXT NOT NULL DEFAULT (DATETIME('now')),
                     created_at TEXT NOT NULL DEFAULT (DATETIME('now')),
                     updated_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+                    task_type TEXT NOT NULL DEFAULT 'page',
                     UNIQUE(run_id, url),
                     FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
@@ -131,9 +131,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_exceptions_status ON exceptions(status);
                 """
             )
+            # Schema migration: add task_type if missing (for pre-0.6.0 databases)
+            cursor.execute("PRAGMA table_info(crawl_tasks)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "task_type" not in columns:
+                cursor.execute(
+                    "ALTER TABLE crawl_tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'page'"
+                )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crawl_tasks_task_type ON crawl_tasks(task_type)"
+            )
             connection.commit()
 
-    def start_run(self, source: str, label: str | None = None) -> RunRecord:
+    def start_run(self, source: str, label: Optional[str] = None) -> RunRecord:
         """Create a new run row and return it."""
 
         started_at = _utcnow()
@@ -144,7 +154,6 @@ class Database:
                 (source, "initialized", started_at, label),
             )
             run_id = cursor.lastrowid
-            assert run_id is not None, "INSERT should always return a row ID"
             connection.commit()
         return RunRecord(
             id=run_id,
@@ -155,7 +164,7 @@ class Database:
             label=label,
         )
 
-    def resume_run(self, source: str) -> RunRecord | None:
+    def resume_run(self, source: str) -> Optional[RunRecord]:
         """Return the most recent non-completed run for a source, if any."""
 
         with self.connect() as connection:
@@ -196,11 +205,16 @@ class Database:
             connection.execute(sql, values)
             connection.commit()
 
-    def enqueue_seed_tasks(self, run_id: int, seeds: Iterable[tuple[str, int]]) -> int:
+    def enqueue_seed_tasks(
+        self, run_id: int, seeds: Iterable[tuple[str, int]], *, task_type: str = "page"
+    ) -> int:
         """Insert seed tasks for a run. Returns number of new tasks queued."""
 
         timestamp = _utcnow()
-        rows = [(run_id, url, depth, timestamp, timestamp, timestamp) for url, depth in seeds]
+        rows = [
+            (run_id, url, depth, task_type, timestamp, timestamp, timestamp)
+            for url, depth in seeds
+        ]
         if not rows:
             return 0
 
@@ -208,16 +222,16 @@ class Database:
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO crawl_tasks (
-                    run_id, url, depth, created_at, updated_at, next_run_at
+                    run_id, url, depth, task_type, created_at, updated_at, next_run_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
             connection.commit()
             return cursor.rowcount
 
-    def list_recent_runs(self, limit: int = 5, source: str | None = None) -> list[RunRecord]:
+    def list_recent_runs(self, limit: int = 5, source: Optional[str] = None) -> list[RunRecord]:
         """Return recent runs ordered by start time descending."""
 
         sql = """
@@ -300,7 +314,7 @@ class Database:
             value = cursor.fetchone()[0]
         return int(value)
 
-    def count_tasks_by_status_for_source(self, source: str) -> dict[str, int]:
+    def count_tasks_by_status_for_source(self, source: str) -> Dict[str, int]:
         """Return aggregated task counts for an entire source across runs."""
 
         with self.connect() as connection:
@@ -318,15 +332,12 @@ class Database:
 
         return {row["status"]: int(row["count"]) for row in records}
 
-    def get_task_status_counts(self, run_id: int) -> dict[str, int]:
+    def get_task_status_counts(self, run_id: int) -> Dict[str, int]:
         """Return counts of tasks grouped by status."""
 
         with self.connect() as connection:
             cursor = connection.execute(
-                """
-                SELECT status, COUNT(*) as count
-                FROM crawl_tasks WHERE run_id = ? GROUP BY status
-                """,
+                "SELECT status, COUNT(*) as count FROM crawl_tasks WHERE run_id = ? GROUP BY status",
                 (run_id,),
             )
             records = cursor.fetchall()
@@ -351,10 +362,10 @@ class Database:
         lease_seconds: float,
         max_retries: int,
         backoff_seconds: float,
-    ) -> list[TaskRecord]:
+    ) -> list["TaskRecord"]:
         """Claim pending tasks for processing."""
 
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         lease_expiry = now + timedelta(seconds=lease_seconds)
         now_str = now.strftime(ISO_FORMAT)
         lease_str = lease_expiry.strftime(ISO_FORMAT)
@@ -363,7 +374,8 @@ class Database:
         with self.connect() as connection:
             cursor = connection.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            max_retries = max(max_retries, 0)
+            if max_retries < 0:
+                max_retries = 0
             cursor.execute(
                 """
                 UPDATE crawl_tasks
@@ -403,7 +415,7 @@ class Database:
             rows = cursor.execute(
                 """
                 SELECT id, url, depth, status, attempt_count, lease_owner, lease_expires_at,
-                       next_run_at
+                       next_run_at, task_type
                 FROM crawl_tasks
                 WHERE run_id = ?
                   AND status = 'pending'
@@ -439,6 +451,7 @@ class Database:
                 lease_owner=lease_owner if row["id"] in task_ids else row["lease_owner"],
                 lease_expires_at=lease_str if row["id"] in task_ids else row["lease_expires_at"],
                 next_run_at=row["next_run_at"],
+                task_type=row["task_type"],
             )
             for row in rows
         ]
@@ -467,9 +480,9 @@ class Database:
         asset_key: str,
         asset_type: str,
         checksum: str,
-        raw_path: str | None = None,
-        normalized_path: str | None = None,
-        metadata_json: str | None = None,
+        raw_path: Optional[str] = None,
+        normalized_path: Optional[str] = None,
+        metadata_json: Optional[str] = None,
     ) -> int:
         """Insert or update asset row and create a new version if needed."""
 
@@ -478,10 +491,8 @@ class Database:
             cursor = connection.cursor()
             cursor.execute(
                 """
-                INSERT INTO assets (
-                    run_id, source_url, asset_key, asset_type, status,
-                    checksum, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+                INSERT INTO assets (run_id, source_url, asset_key, asset_type, status, checksum, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
                 ON CONFLICT(run_id, asset_key) DO UPDATE SET
                     checksum = excluded.checksum,
                     status = 'active',
@@ -501,8 +512,7 @@ class Database:
             cursor.execute(
                 """
                 INSERT INTO asset_versions (
-                    asset_id, version, checksum, created_at,
-                    raw_path, normalized_path, metadata_json
+                    asset_id, version, checksum, created_at, raw_path, normalized_path, metadata_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -526,12 +536,30 @@ class Database:
         *,
         error: str,
         backoff_seconds: float,
+        max_retries: int = 0,
     ) -> None:
-        """Return a task to the queue with backoff."""
+        """Return a task to the queue with backoff, or mark as error if retries exhausted."""
 
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime(ISO_FORMAT)
         next_run = now + timedelta(seconds=backoff_seconds)
         with self.connect() as connection:
+            if max_retries > 0:
+                connection.execute(
+                    """
+                    UPDATE crawl_tasks
+                    SET status = 'error',
+                        attempt_count = attempt_count + 1,
+                        last_error = ?,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        next_run_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND attempt_count + 1 >= ?
+                    """,
+                    (error, now_str, now_str, task_id, max_retries),
+                )
             connection.execute(
                 """
                 UPDATE crawl_tasks
@@ -543,11 +571,12 @@ class Database:
                     next_run_at = ?,
                     updated_at = ?
                 WHERE id = ?
+                  AND status != 'error'
                 """,
                 (
                     error,
                     next_run.strftime(ISO_FORMAT),
-                    now.strftime(ISO_FORMAT),
+                    now_str,
                     task_id,
                 ),
             )
@@ -618,7 +647,9 @@ class Database:
 
     # --- Data Access Methods for CLI ---
 
-    def get_latest_run(self, source: str, statuses: list[str] | None = None) -> RunRecord | None:
+    def get_latest_run(
+        self, source: str, statuses: Optional[list[str]] = None
+    ) -> Optional[RunRecord]:
         """Get most recent run for source, optionally filtered by status."""
 
         if statuses:
@@ -659,11 +690,11 @@ class Database:
     def list_assets(
         self,
         run_id: int,
-        asset_type: str | None = None,
-        url_pattern: str | None = None,
+        asset_type: Optional[str] = None,
+        url_pattern: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[AssetRecord]:
+    ) -> list["AssetRecord"]:
         """List assets with filtering and pagination using optimized CTE."""
 
         with self.connect() as connection:
@@ -723,7 +754,7 @@ class Database:
             for row in rows
         ]
 
-    def get_asset(self, asset_id: int) -> AssetRecord | None:
+    def get_asset(self, asset_id: int) -> Optional["AssetRecord"]:
         """Get single asset by ID with latest version info."""
 
         with self.connect() as connection:
@@ -780,7 +811,9 @@ class Database:
             latest_metadata=row["metadata_json"],
         )
 
-    def get_asset_by_url(self, url: str, run_id: int | None = None) -> AssetRecord | None:
+    def get_asset_by_url(
+        self, url: str, run_id: Optional[int] = None
+    ) -> Optional["AssetRecord"]:
         """Get asset by URL (asset_key), optionally scoped to run."""
 
         if run_id is not None:
@@ -846,8 +879,8 @@ class Database:
         )
 
     def get_asset_version(
-        self, asset_id: int, version: int | None = None
-    ) -> AssetVersionRecord | None:
+        self, asset_id: int, version: Optional[int] = None
+    ) -> Optional["AssetVersionRecord"]:
         """Get specific version or latest if version is None."""
 
         if version is not None:
@@ -889,17 +922,17 @@ class Database:
     def list_tasks_for_run(
         self,
         run_id: int,
-        status: str | None = None,
+        status: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[TaskRecord]:
+    ) -> list["TaskRecord"]:
         """List crawl tasks with optional status filter."""
 
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id, url, depth, status, attempt_count, lease_owner,
-                       lease_expires_at, next_run_at, last_error
+                       lease_expires_at, next_run_at, last_error, task_type
                 FROM crawl_tasks
                 WHERE run_id = ?
                     AND (? IS NULL OR status = ?)
@@ -920,13 +953,14 @@ class Database:
                 lease_expires_at=row["lease_expires_at"],
                 next_run_at=row["next_run_at"],
                 last_error=row["last_error"],
+                task_type=row["task_type"],
             )
             for row in rows
         ]
 
     # --- Source-level Methods for 0.4.0 ---
 
-    def list_sources(self) -> list[SourceSummary]:
+    def list_sources(self) -> list["SourceSummary"]:
         """List all sources with summary statistics."""
 
         with self.connect() as connection:
@@ -958,7 +992,7 @@ class Database:
             for row in rows
         ]
 
-    def get_source_summary(self, source: str) -> SourceSummary | None:
+    def get_source_summary(self, source: str) -> Optional["SourceSummary"]:
         """Get summary for a specific source."""
 
         with self.connect() as connection:
@@ -991,7 +1025,7 @@ class Database:
             last_status=row["last_status"],
         )
 
-    def get_source_stats(self, source: str) -> SourceStats | None:
+    def get_source_stats(self, source: str) -> Optional["SourceStats"]:
         """Get detailed statistics for a source."""
 
         with self.connect() as connection:
@@ -1095,7 +1129,7 @@ class Database:
 
     def get_asset_paths_for_source(
         self, source: str, raw: bool = False
-    ) -> Iterator[tuple[int, str, str | None, str | None]]:
+    ) -> Iterator[tuple[int, str, Optional[str], Optional[str]]]:
         """Yield (asset_id, url, raw_path, normalized_path) for grep."""
 
         with self.connect() as connection:
@@ -1126,7 +1160,7 @@ class Database:
                 row["normalized_path"],
             )
 
-    def delete_source(self, source: str) -> DeleteResult:
+    def delete_source(self, source: str) -> "DeleteResult":
         """Delete all data for a source. Raises ValueError if runs in progress."""
 
         with self.connect() as connection:
@@ -1231,10 +1265,11 @@ class TaskRecord:
     depth: int
     status: str
     attempt_count: int
-    lease_owner: str | None
-    lease_expires_at: str | None
+    lease_owner: Optional[str]
+    lease_expires_at: Optional[str]
     next_run_at: str
-    last_error: str | None = None
+    last_error: Optional[str] = None
+    task_type: str = "page"
 
 
 @dataclass(slots=True)
@@ -1246,14 +1281,14 @@ class AssetRecord:
     asset_key: str
     asset_type: str
     source_url: str
-    checksum: str | None
+    checksum: Optional[str]
     status: str
     created_at: str
     updated_at: str
     version_count: int = 0
-    latest_raw_path: str | None = None
-    latest_normalized_path: str | None = None
-    latest_metadata: str | None = None
+    latest_raw_path: Optional[str] = None
+    latest_normalized_path: Optional[str] = None
+    latest_metadata: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -1265,9 +1300,9 @@ class AssetVersionRecord:
     version: int
     checksum: str
     created_at: str
-    raw_path: str | None = None
-    normalized_path: str | None = None
-    metadata_json: str | None = None
+    raw_path: Optional[str] = None
+    normalized_path: Optional[str] = None
+    metadata_json: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -1277,8 +1312,8 @@ class SourceSummary:
     name: str
     run_count: int
     asset_count: int
-    last_run_at: str | None
-    last_status: str | None
+    last_run_at: Optional[str]
+    last_status: Optional[str]
 
 
 @dataclass(slots=True)
@@ -1286,14 +1321,14 @@ class SourceStats:
     """Detailed statistics for a source."""
 
     name: str
-    runs_by_status: dict[str, int]
-    assets_by_type: dict[str, int]
-    tasks_by_status: dict[str, int]
+    runs_by_status: Dict[str, int]
+    assets_by_type: Dict[str, int]
+    tasks_by_status: Dict[str, int]
     total_raw_bytes: int
     total_normalized_bytes: int
-    first_run_at: str | None
-    last_run_at: str | None
-    avg_duration_seconds: float | None
+    first_run_at: Optional[str]
+    last_run_at: Optional[str]
+    avg_duration_seconds: Optional[float]
 
 
 @dataclass(slots=True)

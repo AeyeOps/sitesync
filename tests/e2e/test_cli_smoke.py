@@ -21,9 +21,9 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, Mapping, Sequence
 
 import pytest
 
@@ -83,7 +83,6 @@ def run_cli(
     print(f"+ {_format_cmd(args)}", flush=True)
     completed = subprocess.run(
         list(args),
-        check=False,
         cwd=str(cwd),
         env=dict(env) if env is not None else None,
         input=input_text,
@@ -119,14 +118,8 @@ def expect_fail(result: CommandResult) -> None:
         )
 
 
-def _strip_ansi(text: str) -> str:
-    """Remove ANSI escape codes from text."""
-    return re.sub(r"\x1b\[[0-9;]*m", "", text)
-
-
 def _extract_error_line(result: CommandResult) -> str:
     combined = (result.stdout or "") + "\n" + (result.stderr or "")
-    combined = _strip_ansi(combined)
     lines = [line.strip() for line in combined.splitlines() if line.strip()]
     for needle in (
         "Invalid value for",
@@ -155,23 +148,49 @@ def read_run_metadata(metadata_dir: Path, run_id: int) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# Minimal valid 1x1 PNG (67 bytes)
+_1X1_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+    b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00"
+    b"\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00"
+    b"\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
 class _TestHandler(http.server.BaseHTTPRequestHandler):
     server_version = "SitesyncTestHTTP/1.0"
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         if self.path in ("/", "/index.html"):
-            body = "<html><head><title>Sitesync OK</title></head><body>Hello world</body></html>"
+            body = (
+                "<html><head><title>Sitesync OK</title></head>"
+                '<body>Hello world<img src="/image.png"></body></html>'
+            )
             self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+        elif self.path == "/image.png":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(_1X1_PNG)))
+            self.end_headers()
+            self.wfile.write(_1X1_PNG)
         elif self.path.startswith("/private"):
-            body = "<html><head><title>Denied</title></head><body>Access denied</body></html>"
+            body = (
+                "<html><head><title>Denied</title></head>"
+                "<body>Access denied</body></html>"
+            )
             self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
         else:
             body = "<html><body>Not found</body></html>"
             self.send_response(404)
-
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib API
         message = format % args if args else format
@@ -249,8 +268,8 @@ def _assert_playwright_ready() -> None:
             browser.close()
     except Exception as exc:  # pragma: no cover - environment dependent
         pytest.fail(
-            "Playwright browsers are missing or not runnable; "
-            f"run `uv run playwright install chromium`.\n{exc}"
+            "Playwright browsers are missing or not runnable; run `uv run playwright install chromium`.\n"
+            f"{exc}"
         )
 
 
@@ -261,7 +280,11 @@ def _safe_path_component(value: str) -> str:
 
 @pytest.fixture(scope="module")
 def e2e_context() -> Iterable[E2EContext]:
-    sitesync = (sys.executable, "-m", "sitesync")
+    sitesync_bin = os.environ.get("SITESYNC_BIN", "").strip()
+    if sitesync_bin:
+        sitesync = (sitesync_bin,)
+    else:
+        sitesync = (sys.executable, "-m", "sitesync")
     print(f"Sitesync e2e smoke using: {_format_cmd(sitesync)}", flush=True)
 
     keep_tmp = os.environ.get("SITESYNC_E2E_KEEP_TMP", "").strip().lower() in {
@@ -319,6 +342,32 @@ def e2e_work_dir(e2e_context: E2EContext, request: pytest.FixtureRequest) -> Wor
 @pytest.fixture(scope="module")
 def playwright_ready() -> None:
     _assert_playwright_ready()
+
+
+def test_init_accepts_directory_path(e2e_context: E2EContext) -> None:
+    init_dir = e2e_context.root / "init-case"
+    init_dir.mkdir(parents=True, exist_ok=True)
+
+    init_input = "\n".join(
+        [
+            ".",  # directory path on purpose
+            "default",
+            f"{e2e_context.base_url}/",
+            "",  # end URLs
+            "",  # accept allowed domains default
+            "1",
+            "null",
+        ]
+    )
+    result = run_cli(
+        (*e2e_context.sitesync, "init"),
+        cwd=init_dir,
+        input_text=init_input + "\n",
+        timeout_seconds=20.0,
+    )
+    expect_ok(result)
+    config_written = init_dir / "config" / "local.yaml"
+    assert config_written.exists(), f"Expected init to write {config_written}"
 
 
 def test_crawl_no_seed_urls_completes_and_writes_metadata(e2e_work_dir: WorkDir) -> None:
@@ -381,7 +430,7 @@ def test_crawl_rejects_invalid_cli_values(
             "http-200",
             lambda base: f"{base}/",
             lambda tasks, work: (
-                int(tasks.get("finished", 0)) == 1
+                int(tasks.get("finished", 0)) >= 1
                 and int(tasks.get("error", 0)) == 0
                 and any((work.output_root / "raw").glob("*.html"))
                 and any((work.output_root / "normalized").glob("*.txt"))
@@ -395,9 +444,7 @@ def test_crawl_rejects_invalid_cli_values(
         (
             "missing-scheme",
             lambda base: base.removeprefix("http://") + "/",
-            lambda tasks, work: (
-                int(tasks.get("finished", 0)) == 1 or int(tasks.get("error", 0)) == 1
-            ),
+            lambda tasks, work: int(tasks.get("finished", 0)) == 1 or int(tasks.get("error", 0)) == 1,
         ),
         (
             "invalid-url",
@@ -445,3 +492,51 @@ def test_crawl_url_variants(
     tasks = meta.get("stats", {}).get("tasks", {})
     assert meta.get("run", {}).get("status") == "completed"
     assert assertion(tasks, e2e_work_dir), f"Unexpected task counts for {label}: {tasks}"
+
+
+def test_crawl_downloads_media_assets(
+    e2e_context: E2EContext,
+    e2e_work_dir: WorkDir,
+    playwright_ready: None,
+) -> None:
+    """Crawl a page with an <img> tag and verify the media asset is downloaded."""
+    start_url = f"{e2e_context.base_url}/"
+    result = run_cli(
+        (
+            *e2e_work_dir.base_cmd,
+            "crawl",
+            "--start-url",
+            start_url,
+            "--depth",
+            "2",
+            "--parallel",
+            "1",
+        ),
+        cwd=e2e_work_dir.path,
+        input_text="",
+        timeout_seconds=120.0,
+    )
+    expect_ok(result)
+
+    run_id = latest_run_id(e2e_work_dir.db_path)
+    meta = read_run_metadata(e2e_work_dir.metadata_dir, run_id)
+    assert meta.get("run", {}).get("status") == "completed"
+
+    # Verify media directory has a PNG file
+    media_dir = e2e_work_dir.output_root / "media"
+    png_files = list(media_dir.glob("*.png")) if media_dir.exists() else []
+    assert len(png_files) >= 1, f"Expected at least one PNG in {media_dir}, found {png_files}"
+
+    # Verify the DB has a media asset
+    with sqlite3.connect(e2e_work_dir.db_path) as conn:
+        media_tasks = conn.execute(
+            "SELECT COUNT(*) FROM crawl_tasks WHERE run_id = ? AND task_type = 'media'",
+            (run_id,),
+        ).fetchone()[0]
+        assert media_tasks >= 1, f"Expected at least one media task, found {media_tasks}"
+
+        media_assets = conn.execute(
+            "SELECT COUNT(*) FROM assets WHERE run_id = ? AND asset_type = 'media'",
+            (run_id,),
+        ).fetchone()[0]
+        assert media_assets >= 1, f"Expected at least one media asset, found {media_assets}"

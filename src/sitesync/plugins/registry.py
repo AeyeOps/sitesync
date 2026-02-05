@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
 from importlib import import_module
-from typing import Any
+from typing import Any, Iterable, List, Sequence
 
 from sitesync.plugins.base import AssetPlugin
 
@@ -16,7 +15,7 @@ class PluginRegistry:
     """Registry that discovers and selects asset plugins."""
 
     def __init__(self) -> None:
-        self._plugins: list[AssetPlugin] = []
+        self._plugins: List[AssetPlugin] = []
 
     def register(self, plugin: AssetPlugin) -> None:
         if any(existing.name == plugin.name for existing in self._plugins):
@@ -74,3 +73,4 @@ def load_default_plugins() -> None:
     """Import built-in plugins so they self-register."""
 
     import_module("sitesync.plugins.simple_page")
+    import_module("sitesync.plugins.media_asset")

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import sys
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from importlib import resources
+import importlib.resources as resources
 from pathlib import Path
-from typing import Any
+import sys
+from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlparse
 
 import yaml
@@ -23,7 +22,7 @@ class LoggingSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: Path | None = None
+    path: Optional[Path] = None
     level: str = Field(default="info")
 
     @field_validator("level", mode="before")
@@ -50,7 +49,7 @@ class CrawlerSettings(BaseModel):
     backoff_min_seconds: float = Field(default=1.0, ge=0.0)
     backoff_max_seconds: float = Field(default=60.0, ge=0.0)
     backoff_multiplier: float = Field(default=2.0, ge=1.0)
-    fetch_timeout_seconds: float | None = Field(default=None, ge=0.1)
+    fetch_timeout_seconds: Optional[float] = Field(default=None, ge=0.1)
 
 
 class DomainFilter(BaseModel):
@@ -80,7 +79,9 @@ class DomainFilter(BaseModel):
                 path = parsed.path or "/"
             if not path.startswith("/"):
                 path = f"/{path}"
-            if path != "/" and not any(ch in path for ch in ("*", "?", "[")) and path.endswith("/"):
+            if path != "/" and not any(ch in path for ch in ("*", "?", "[")) and path.endswith(
+                "/"
+            ):
                 path = path.rstrip("/") or "/"
             cleaned.append(path)
         return cleaned
@@ -93,15 +94,15 @@ class SourceSettings(BaseModel):
 
     name: str
     start_urls: list[str] = Field(default_factory=list)
-    allowed_domains: dict[str, DomainFilter] = Field(default_factory=dict)
+    allowed_domains: Dict[str, DomainFilter] = Field(default_factory=dict)
     depth: int = Field(default=1, ge=0)
     plugins: list[str] = Field(default_factory=list)
-    parallel_agents: int | None = Field(default=None, ge=1)
-    pages_per_agent: int | None = Field(default=None, ge=1)
-    jitter_seconds: float | None = Field(default=None, ge=0.0)
-    max_pages: int | None = Field(default=None, ge=1)
+    parallel_agents: Optional[int] = Field(default=None, ge=1)
+    pages_per_agent: Optional[int] = Field(default=None, ge=1)
+    jitter_seconds: Optional[float] = Field(default=None, ge=0.0)
+    max_pages: Optional[int] = Field(default=None, ge=1)
     fetcher: str = Field(default="playwright")
-    fetcher_options: dict[str, Any] = Field(default_factory=dict)
+    fetcher_options: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("fetcher", mode="before")
     @classmethod
@@ -114,12 +115,12 @@ class SourceSettings(BaseModel):
 
     @field_validator("allowed_domains", mode="before")
     @classmethod
-    def _normalize_allowed_domains(cls, value: Any) -> dict[str, DomainFilter]:
+    def _normalize_allowed_domains(cls, value: Any) -> Dict[str, DomainFilter]:
         if value is None:
             return {}
         if not isinstance(value, dict):
             raise TypeError("allowed_domains must be a mapping of domain -> filter rules.")
-        normalized: dict[str, DomainFilter] = {}
+        normalized: Dict[str, DomainFilter] = {}
         for key, raw in value.items():
             if not isinstance(key, str):
                 raise TypeError("allowed_domains keys must be strings.")
@@ -135,7 +136,7 @@ class StorageSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: Path | None = None
+    path: Optional[Path] = None
 
 
 class OutputSettings(BaseModel):
@@ -147,6 +148,7 @@ class OutputSettings(BaseModel):
     raw_subdir: str = "raw"
     normalized_subdir: str = "normalized"
     metadata_subdir: str = "runs"
+    media_subdir: str = "media"
 
 
 class ConfigModel(BaseModel):
@@ -163,7 +165,7 @@ class ConfigModel(BaseModel):
     sources: list[SourceSettings] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _validate_sources(self) -> ConfigModel:
+    def _validate_sources(self) -> "ConfigModel":
         names = {source.name for source in self.sources}
         if self.sources and len(names) != len(self.sources):
             raise ValueError("Source names must be unique.")
@@ -181,7 +183,7 @@ class Config:
     model: ConfigModel
     raw: Mapping[str, Any] = field(repr=False)
     loaded_from: tuple[str, ...] = field(default_factory=tuple, repr=False)
-    _sources_by_name: dict[str, SourceSettings] = field(init=False, repr=False)
+    _sources_by_name: Dict[str, SourceSettings] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._sources_by_name = {source.name: source for source in self.model.sources}
@@ -216,7 +218,7 @@ class Config:
 
         return self.model.default_source
 
-    def get_source(self, name: str | None = None) -> SourceSettings:
+    def get_source(self, name: Optional[str] = None) -> SourceSettings:
         """Fetch a source configuration by name."""
 
         target = name or self.default_source
@@ -231,10 +233,10 @@ class Config:
         return self.model.model_dump()
 
 
-def load_config(path: Path | None = None) -> Config:
+def load_config(path: Optional[Path] = None) -> Config:
     """Load configuration from defaults/local overrides, or from an explicit config document."""
 
-    merged: dict[str, Any] = {}
+    merged: Dict[str, Any] = {}
     loaded_from: list[str] = []
 
     if path is not None:
@@ -280,7 +282,7 @@ def load_config(path: Path | None = None) -> Config:
     return Config(model=model, raw=merged, loaded_from=tuple(loaded_from))
 
 
-def _resolve_path(path: Path) -> Path | None:
+def _resolve_path(path: Path) -> Optional[Path]:
     """Resolve configuration paths relative to the current working directory."""
 
     if path is None:
@@ -288,7 +290,7 @@ def _resolve_path(path: Path) -> Path | None:
     return path if path.is_absolute() else Path.cwd() / path
 
 
-def _resolve_packaged_path(path: Path) -> Path | None:
+def _resolve_packaged_path(path: Path) -> Optional[Path]:
     """Resolve paths embedded in packaged binaries (e.g., PyInstaller)."""
 
     base = getattr(sys, "_MEIPASS", None)
@@ -297,7 +299,7 @@ def _resolve_packaged_path(path: Path) -> Path | None:
     return Path(base) / path
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
+def _read_yaml(path: Path) -> Dict[str, Any]:
     """Read a YAML file into a dictionary."""
 
     content = path.read_text(encoding="utf-8")
@@ -307,7 +309,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def _read_packaged_yaml(package: str, name: str) -> dict[str, Any] | None:
+def _read_packaged_yaml(package: str, name: str) -> Optional[Dict[str, Any]]:
     """Read YAML embedded in a Python package via importlib.resources."""
 
     try:
@@ -322,10 +324,10 @@ def _read_packaged_yaml(package: str, name: str) -> dict[str, Any] | None:
     return data
 
 
-def _merge_dicts(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+def _merge_dicts(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
     """Deep-merge two dictionaries, with override values taking precedence."""
 
-    result: dict[str, Any] = dict(base)
+    result: Dict[str, Any] = dict(base)
     for key, value in override.items():
         if key == "sources" and isinstance(result.get(key), list) and isinstance(value, list):
             result[key] = _merge_sources(result[key], value)
@@ -340,7 +342,7 @@ def _merge_sources(base: list[Any], override: list[Any]) -> list[Any]:
     """Merge source lists by name while preserving unspecified fields."""
 
     result: list[Any] = []
-    name_to_index: dict[str, int] = {}
+    name_to_index: Dict[str, int] = {}
 
     for entry in base:
         if isinstance(entry, dict) and "name" in entry:

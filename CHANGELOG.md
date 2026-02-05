@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-02-04
+
+### Added
+- HTTP fetcher for binary and media asset downloads
+- Media asset normalization plugin with category mapping
+- Media URL discovery in executor crawl pipeline
+- Tests for HTTP fetcher, media plugin, and expanded executor coverage
+- Quality script (`scripts/make_quality.sh`) consolidating lint/typecheck/format
+
+### Changed
+- Enhanced executor with retry logic and concurrent fetching improvements
+- Extended storage DB with media tracking columns and methods
+- Updated CLI and config loader for media fetching support
+- Simplified Makefile lint target to call shared quality script
+
 ## [0.6.0] - 2026-01-20
 
 ### Added

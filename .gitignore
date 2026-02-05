@@ -31,6 +31,7 @@ dist/
 # Logs
 logs/
 *.log
+sitesync.log*
 
 # Local config / secrets
 .env

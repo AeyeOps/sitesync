@@ -11,35 +11,36 @@ import platform
 import signal
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from hashlib import sha256
 from itertools import islice
+from datetime import datetime, timezone
+from hashlib import sha256
+from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import typer
 import yaml
+
 from dotenv import load_dotenv
 
 from sitesync import get_version
 from sitesync.config import Config, SourceSettings, load_config
 from sitesync.core import CrawlExecutor, Orchestrator
-from sitesync.fetchers import NullFetcher, PlaywrightFetcher
+from sitesync.fetchers import HttpFetcher, NullFetcher, PlaywrightFetcher
 from sitesync.logging import configure_logging
 from sitesync.storage import Database, RunRecord
 from sitesync.ui import Dashboard
 from sitesync.ui.hotkeys import monitor_double_escape
 
 try:  # Playwright is optional until crawl runs
-    from playwright._impl._errors import Error as PlaywrightError
-    from playwright._impl._errors import TargetClosedError
+    from playwright._impl._errors import Error as PlaywrightError  # type: ignore[attr-defined]
+    from playwright._impl._errors import TargetClosedError  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover - playwright not installed
-    PlaywrightError = None  # type: ignore[assignment]
-    TargetClosedError = None  # type: ignore[assignment]
-from sitesync.cli.data import data_app
-from sitesync.plugins.registry import load_default_plugins
-from sitesync.plugins.registry import registry as plugin_registry
+    PlaywrightError = None  # type: ignore
+    TargetClosedError = None  # type: ignore
+from sitesync.plugins.registry import load_default_plugins, registry as plugin_registry
 from sitesync.reports import write_status_report
+from sitesync.cli.data import data_app
 
 
 @dataclass(slots=True)
@@ -48,9 +49,10 @@ class OutputDirs:
     raw: pathlib.Path
     normalized: pathlib.Path
     metadata: pathlib.Path
+    media: pathlib.Path
 
 
-def _load_environment(env_file: pathlib.Path | None) -> None:
+def _load_environment(env_file: Optional[pathlib.Path]) -> None:
     """Load environment variables from .env files."""
 
     if env_file is not None:
@@ -61,8 +63,8 @@ def _load_environment(env_file: pathlib.Path | None) -> None:
 
 def _prepare_logging(
     config: Config,
-    override_path: pathlib.Path | None,
-    override_level: str | None,
+    override_path: Optional[pathlib.Path],
+    override_level: Optional[str],
 ) -> tuple[logging.Logger, pathlib.Path]:
     """Configure logging based on configuration and overrides."""
 
@@ -91,11 +93,12 @@ def _prepare_output_dirs(config: Config) -> OutputDirs:
     raw = base / config.outputs.raw_subdir
     normalized = base / config.outputs.normalized_subdir
     metadata = base / config.outputs.metadata_subdir
+    media = base / config.outputs.media_subdir
 
-    for path in {base, raw, normalized, metadata}:
+    for path in {base, raw, normalized, metadata, media}:
         path.mkdir(parents=True, exist_ok=True)
 
-    return OutputDirs(base=base, raw=raw, normalized=normalized, metadata=metadata)
+    return OutputDirs(base=base, raw=raw, normalized=normalized, metadata=metadata, media=media)
 
 
 def _build_fetcher(source: SourceSettings, logger: logging.Logger, outputs: OutputDirs):
@@ -127,11 +130,12 @@ def _write_run_metadata(
     counts = database.get_task_status_counts(run_record.id)
     exceptions_open = database.count_open_exceptions(run_record.id)
     allowed_domains = {
-        domain: rules.model_dump() for domain, rules in source.allowed_domains.items()
+        domain: rules.model_dump()
+        for domain, rules in source.allowed_domains.items()
     }
 
     metadata = {
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "run": {
             "id": run_record.id,
             "source": run_record.source,
@@ -182,7 +186,7 @@ def _relative_path(path: pathlib.Path) -> str:
         return str(path)
 
 
-def _load_run_metadata(metadata_dir: pathlib.Path, run_id: int) -> dict[str, object] | None:
+def _load_run_metadata(metadata_dir: pathlib.Path, run_id: int) -> Optional[Dict[str, object]]:
     path = metadata_dir / f"run-{run_id}.json"
     if not path.exists():
         return None
@@ -215,37 +219,37 @@ def _version_callback(value: bool) -> None:
 @app.callback()
 def main(  # pragma: no cover - exercised via CLI invocation
     ctx: typer.Context,
-    config: pathlib.Path | None = typer.Option(
+    config: Optional[pathlib.Path] = typer.Option(
         None,
         "--config",
         metavar="PATH",
         help="Path to YAML configuration file (used exclusively).",
     ),
-    env_file: pathlib.Path | None = typer.Option(
+    env_file: Optional[pathlib.Path] = typer.Option(
         None,
         "--env-file",
         metavar="PATH",
         help="Load environment variables from .env-style file before execution.",
     ),
-    log_level: str | None = typer.Option(
+    log_level: Optional[str] = typer.Option(
         None,
         "--log-level",
         metavar="LEVEL",
         help="Override the configured log level (debug, info, warn, error).",
     ),
-    log_path: pathlib.Path | None = typer.Option(
+    log_path: Optional[pathlib.Path] = typer.Option(
         None,
         "--log-path",
         metavar="PATH",
         help="Override the base directory or file for log output.",
     ),
-    source: str | None = typer.Option(
+    source: Optional[str] = typer.Option(
         None,
         "--source",
         metavar="NAME",
         help="Select a configured source profile to crawl.",
     ),
-    version: bool | None = typer.Option(
+    version: Optional[bool] = typer.Option(
         None,
         "--version",
         callback=_version_callback,
@@ -290,7 +294,7 @@ def main(  # pragma: no cover - exercised via CLI invocation
 
 @app.command()
 def init(
-    path: pathlib.Path | None = typer.Option(
+    path: Optional[pathlib.Path] = typer.Option(
         None,
         "--path",
         metavar="PATH",
@@ -319,13 +323,10 @@ def init(
         typer.echo(f"Config path is a directory; writing {destination}", err=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    if (
-        destination.exists()
-        and not force
-        and not typer.confirm(f"{destination} already exists. Overwrite?", default=False)
-    ):
-        typer.echo("Aborted.")
-        raise typer.Exit(code=1)
+    if destination.exists() and not force:
+        if not typer.confirm(f"{destination} already exists. Overwrite?", default=False):
+            typer.echo("Aborted.")
+            raise typer.Exit(code=1)
 
     source_name = typer.prompt("Source name", default="default").strip() or "default"
 
@@ -362,7 +363,7 @@ def init(
         """Prompt for allowed domains one at a time."""
         domains: list[str] = []
         # First, prompt with defaults pre-filled
-        for default in defaults:
+        for i, default in enumerate(defaults):
             value = typer.prompt(
                 "Allowed domain (blank to finish)",
                 default=default,
@@ -385,8 +386,7 @@ def init(
 
     def _prompt_path_list(label: str, domain: str) -> list[str]:
         value = typer.prompt(
-            f"{label} paths for {domain} "
-            "(comma-separated; exact by default, use /path/** for subtree)",
+            f"{label} paths for {domain} (comma-separated; exact by default, use /path/** for subtree)",
             default="",
             show_default=False,
         )
@@ -492,7 +492,7 @@ def config_show(
     """Show the effective configuration for this invocation."""
 
     config: Config = ctx.obj["config"]
-    config_path: pathlib.Path | None = ctx.obj.get("config_path")
+    config_path: Optional[pathlib.Path] = ctx.obj.get("config_path")
 
     normalized_format = format.strip().lower()
     if normalized_format not in {"yaml", "json"}:
@@ -521,19 +521,19 @@ def config_show(
 def crawl(  # pragma: no cover - placeholder until implementation
     ctx: typer.Context,
     resume: bool = typer.Option(False, "--resume", help="Resume an interrupted crawl."),
-    start_url: list[str] | None = typer.Option(
+    start_url: Optional[list[str]] = typer.Option(
         None,
         "--start-url",
         metavar="URL",
         help="Seed URL to enqueue for the run. May be provided multiple times.",
     ),
-    depth: int | None = typer.Option(
+    depth: Optional[int] = typer.Option(
         None,
         "--depth",
         min=0,
         help="Override maximum crawl depth while this command runs.",
     ),
-    parallel: int | None = typer.Option(
+    parallel: Optional[int] = typer.Option(
         None,
         "--parallel",
         min=1,
@@ -565,8 +565,9 @@ def crawl(  # pragma: no cover - placeholder until implementation
         parallel_override=parallel,
     )
 
-    run_status = "resumed" if summary.resumed else "new"
-    typer.echo(f"Run {summary.run.id} ({run_status}) queued {summary.queued_seeds} seed task(s).")
+    typer.echo(
+        f"Run {summary.run.id} ({'resumed' if summary.resumed else 'new'}) queued {summary.queued_seeds} seed task(s)."
+    )
     typer.echo(
         f"Depth={summary.depth} parallel_agents={summary.parallel_agents} log={ctx.obj['log_file']}"
     )
@@ -581,16 +582,16 @@ def crawl(  # pragma: no cover - placeholder until implementation
 
     if summary.resumed:
         typer.echo(
-            f"Resuming run {summary.run.id}: "
-            f"pending={pending} in_progress={in_progress} finished={finished}"
+            f"Resuming run {summary.run.id}: pending={pending} in_progress={in_progress} finished={finished}"
         )
-    elif summary.seed_urls:
-        preview_text = ", ".join(seed_preview)
-        if seed_more > 0:
-            preview_text += f", … (+{seed_more} more)"
-        typer.echo(f"Seeded {summary.queued_seeds} URL(s): {preview_text}")
     else:
-        typer.echo("No seed URLs supplied; nothing to crawl.")
+        if summary.seed_urls:
+            preview_text = ", ".join(seed_preview)
+            if seed_more > 0:
+                preview_text += f", … (+{seed_more} more)"
+            typer.echo(f"Seeded {summary.queued_seeds} URL(s): {preview_text}")
+        else:
+            typer.echo("No seed URLs supplied; nothing to crawl.")
 
     if pending + in_progress == 0:
         logger.info("Run %s has no tasks to process; marking completed.", summary.run.id)
@@ -610,6 +611,7 @@ def crawl(  # pragma: no cover - placeholder until implementation
         return
 
     fetcher = _build_fetcher(source, logger, output_dirs)
+    http_fetcher = HttpFetcher.from_options(logger, options={"media_dir": output_dirs.media})
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     dashboard = Dashboard(enabled=interactive)
 
@@ -658,7 +660,7 @@ def crawl(  # pragma: no cover - placeholder until implementation
                 fetch_metadata = {"raw": result.metadata_json}
 
         def _fallback_checksum() -> str:
-            return sha256(f"{task.url}-{uuid4()}".encode()).hexdigest()
+            return sha256(f"{task.url}-{uuid4()}".encode("utf-8")).hexdigest()
 
         async def _store_record(
             *,
@@ -748,6 +750,7 @@ def crawl(  # pragma: no cover - placeholder until implementation
         dashboard=dashboard,
         on_success=handle_success,
         on_failure=handle_failure,
+        media_fetcher=http_fetcher,
     )
 
     stop_event = asyncio.Event()
@@ -801,7 +804,7 @@ def crawl(  # pragma: no cover - placeholder until implementation
             except NotImplementedError:
                 previous = signal.getsignal(sig)
 
-                def _handler(_signum: int, _frame: object) -> None:
+                def _handler(*_args):  # type: ignore[no-untyped-def]
                     _handle_signal()
 
                 signal.signal(sig, _handler)
@@ -815,7 +818,7 @@ def crawl(  # pragma: no cover - placeholder until implementation
             if kind == "loop":
                 loop.remove_signal_handler(sig)
             else:
-                signal.signal(sig, previous)  # ty: ignore[invalid-argument-type]
+                signal.signal(sig, previous)
 
     async def run_executor() -> None:
         loop = asyncio.get_running_loop()
@@ -833,7 +836,7 @@ def crawl(  # pragma: no cover - placeholder until implementation
 
     async def run_with_hotkey() -> bool:
         loop = asyncio.get_running_loop()
-        hint_timer: asyncio.TimerHandle | None = None
+        hint_timer: Optional[asyncio.TimerHandle] = None
         _install_exception_handler(loop)
 
         def show_press_hint() -> None:
@@ -958,8 +961,7 @@ def status(  # pragma: no cover - placeholder until implementation
         in_progress = overview_counts.get("in_progress", 0)
         remaining = pending + in_progress
         typer.echo(
-            f"  total={total} finished={finished} remaining={remaining} "
-            f"in_progress={in_progress} errors={errors}"
+            f"  total={total} finished={finished} remaining={remaining} in_progress={in_progress} errors={errors}"
         )
     else:
         typer.echo("  no crawl activity recorded yet.")
@@ -981,15 +983,14 @@ def status(  # pragma: no cover - placeholder until implementation
     errors = current_counts.get("error", 0)
 
     metadata = _load_run_metadata(output_dirs.metadata, current.id)
-    raw_run_info = metadata.get("run", {}) if metadata else {}
-    run_info = dict(raw_run_info) if isinstance(raw_run_info, dict) else {}
+    run_info = metadata.get("run", {}) if metadata else {}
     resumed_flag = bool(run_info.get("resumed"))
     depth = run_info.get("depth")
     parallel_agents = run_info.get("parallel_agents")
-    raw_seeds = run_info.get("seed_urls")
-    seed_urls = raw_seeds if isinstance(raw_seeds, list) else []
-    raw_queued = run_info.get("queued_seeds")
-    queued_seeds = raw_queued if isinstance(raw_queued, int) else None
+    seed_urls = run_info.get("seed_urls", []) if isinstance(run_info.get("seed_urls"), list) else []
+    queued_seeds = (
+        run_info.get("queued_seeds") if isinstance(run_info.get("queued_seeds"), int) else None
+    )
 
     typer.echo("")
     status_label = current.status
@@ -1001,16 +1002,11 @@ def status(  # pragma: no cover - placeholder until implementation
     if resumed_flag:
         typer.echo("  resumed: yes")
     if depth is not None or parallel_agents is not None:
-        effective_depth = depth if depth is not None else source.depth
-        effective_parallel = (
-            parallel_agents
-            if parallel_agents is not None
-            else (source.parallel_agents or config.crawler.parallel_agents)
+        typer.echo(
+            f"  depth={depth if depth is not None else source.depth} parallel={parallel_agents if parallel_agents is not None else (source.parallel_agents or config.crawler.parallel_agents)}"
         )
-        typer.echo(f"  depth={effective_depth} parallel={effective_parallel}")
     typer.echo(
-        f"  queue pending={pending} in_progress={in_progress} finished={finished} "
-        f"errors={errors} exceptions={exceptions_open}"
+        f"  queue pending={pending} in_progress={in_progress} finished={finished} errors={errors} exceptions={exceptions_open}"
     )
 
     if seed_urls:
@@ -1040,13 +1036,8 @@ def status(  # pragma: no cover - placeholder until implementation
         for run in runs:
             counts = database.get_task_status_counts(run.id)
             exceptions = database.count_open_exceptions(run.id)
-            pend = counts.get("pending", 0)
-            prog = counts.get("in_progress", 0)
-            done = counts.get("finished", 0)
-            errs = counts.get("error", 0)
             typer.echo(
-                f"  run {run.id} queue pending={pend} in_progress={prog} "
-                f"finished={done} errors={errs} exceptions={exceptions}"
+                f"  run {run.id} queue pending={counts.get('pending', 0)} in_progress={counts.get('in_progress', 0)} finished={counts.get('finished', 0)} errors={counts.get('error', 0)} exceptions={exceptions}"
             )
 
     logger.debug("Status command listed %s runs for source '%s'.", len(runs), source.name)
@@ -1059,7 +1050,7 @@ def version() -> None:
     typer.echo(get_version())
 
 
-def _capture_terminal_state() -> tuple[str, list[int]] | None:
+def _capture_terminal_state() -> Optional[tuple[str, list[int]]]:
     if os.name == "nt":
         return None
     try:
@@ -1072,13 +1063,13 @@ def _capture_terminal_state() -> tuple[str, list[int]] | None:
         except termios.error:  # pragma: no cover - best effort
             return None
     try:
-        with open("/dev/tty", encoding="utf-8", errors="ignore") as stream:
+        with open("/dev/tty", "r", encoding="utf-8", errors="ignore") as stream:
             return ("tty", list(termios.tcgetattr(stream.fileno())))
     except (OSError, termios.error):  # pragma: no cover - best effort
         return None
 
 
-def _restore_terminal(state: tuple[str, list[int]] | None) -> None:
+def _restore_terminal(state: Optional[tuple[str, list[int]]]) -> None:
     if os.name != "nt":
         try:
             if state is not None:
@@ -1086,19 +1077,11 @@ def _restore_terminal(state: tuple[str, list[int]] | None) -> None:
 
                 source, attrs = state
                 if source == "stdin" and sys.stdin.isatty():
-                    termios.tcsetattr(
-                        sys.stdin.fileno(),
-                        termios.TCSADRAIN,
-                        attrs,  # ty: ignore[invalid-argument-type]
-                    )
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
                     return
                 if source == "tty":
-                    with open("/dev/tty", encoding="utf-8", errors="ignore") as stream:
-                        termios.tcsetattr(
-                            stream.fileno(),
-                            termios.TCSADRAIN,
-                            attrs,  # ty: ignore[invalid-argument-type]
-                        )
+                    with open("/dev/tty", "r", encoding="utf-8", errors="ignore") as stream:
+                        termios.tcsetattr(stream.fileno(), termios.TCSADRAIN, attrs)
                     return
         except Exception:  # pragma: no cover - best effort
             pass
@@ -1115,14 +1098,16 @@ def _restore_terminal(state: tuple[str, list[int]] | None) -> None:
         pass
 
 
-def _emit_runtime_deny_suggestion(*, executor: CrawlExecutor, source: SourceSettings) -> None:
+def _emit_runtime_deny_suggestion(
+    *, executor: CrawlExecutor, source: SourceSettings
+) -> None:
     runtime_denies = executor.get_runtime_denies()
     if not runtime_denies:
         return
 
-    suggested_domains: dict[str, dict[str, list[str]]] = {}
+    suggested_domains: Dict[str, Dict[str, list[str]]] = {}
     for domain, rules in source.allowed_domains.items():
-        entry: dict[str, list[str]] = {
+        entry: Dict[str, list[str]] = {
             "allow_paths": list(rules.allow_paths),
         }
         merged = list(rules.deny_paths)
@@ -1171,7 +1156,7 @@ def _emit_run_exit_summary(*, database: Database, run_id: int) -> None:
     )
 
 
-def _format_time(timestamp: str | None) -> str:
+def _format_time(timestamp: Optional[str]) -> str:
     if not timestamp:
         return "--"
     try:
@@ -1184,11 +1169,11 @@ def _format_time(timestamp: str | None) -> str:
 
 def _compute_history(
     database: Database,
-    runs: list[RunRecord],
+    runs: List[RunRecord],
     current_run_id: int,
     current_resumed: bool,
-) -> list[dict[str, object]]:
-    history: list[dict[str, object]] = []
+) -> List[Dict[str, object]]:
+    history: List[Dict[str, object]] = []
     for run in runs:
         counts = database.get_task_status_counts(run.id)
         total = sum(counts.values())
